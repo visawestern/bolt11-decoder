@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BOLT11 Decoder — локально</title>
+<style>
+:root{color-scheme:light dark}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:860px;margin:24px auto;padding:0 16px;line-height:1.45}
+textarea{width:100%;min-height:110px;font-family:ui-monospace,monospace;font-size:13px;padding:10px;box-sizing:border-box}
+button{padding:8px 14px;margin:6px 6px 6px 0;cursor:pointer}
+table{border-collapse:collapse;width:100%;margin-top:12px;font-size:14px}
+td,th{border:1px solid #8884;padding:6px 8px;text-align:left;vertical-align:top;word-break:break-all}
+th{width:220px}
+.err{color:#b00020;font-weight:bold;white-space:pre-wrap}
+.ok{color:#0a7a2f;font-weight:bold}
+.mono{font-family:ui-monospace,monospace;font-size:12.5px}
+.small{font-size:13px;opacity:.85}
+.ex button{font-size:12px;padding:4px 8px}
+code{background:#8882;padding:1px 5px;border-radius:4px}
+</style>
+</head>
+<body>
+<h1>BOLT11 Decoder (100% локально, без библиотек/CDN)</h1>
+<p class="small">Вставь Lightning-инвойс (<code>lnbc…</code> / <code>lntb…</code>, можно с префиксом <code>lightning:</code>, верхний или нижний регистр — но не смешанный). Bech32 декодируется <b>своим кодом</b> ниже. Подпись <b>не проверяется криптографически</b> (только факт наличия 104 групп / 65 байт); payee извлекается только из <code>n</code>-поля, иначе честно пишется «требует secp256k1-recovery».</p>
+<textarea id="inv" placeholder="lnbc…"></textarea>
+<div>
+<button id="dec">Разобрать</button>
+<button id="clr">Очистить</button>
+</div>
+<div class="ex small">
+<p>Тестовые векторы из BOLT11-спеки (кнопка подставляет):</p>
+<button data-ex="0">1. lnbc без суммы (donation)</button>
+<button data-ex="1">2. lnbc2500u кофе + expiry 60</button>
+<button data-ex="2">3. lnbc20m hashed list</button>
+<button data-ex="3">4. lntb20m fallback</button>
+<button data-ex="4">5. lnbc20m route hints (r)</button>
+</div>
+<div id="out"></div>
+<hr>
+<p class="small">Ошибки честные: мусор / смешанный регистр / нет разделителя <code>1</code> / неверный charset / неверная контрольная сумма bech32 / неверный префикс / неверная сумма / обрезанный инвойс / нет p,s,d/h / неверные длины. См. <span class="mono">README.md</span> и <span class="mono">TEST_PLAN.md</span>.</p>
+<script>
+"use strict";
+/* ---- свой bech32 (BIP-173), только decode, без лимита 90 ---- */
+var CHARSET="qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+var CMAP={}; for(var _i=0;_i<CHARSET.length;_i++) CMAP[CHARSET[_i]]=_i;
+function hrpExpand(hrp){var r=[];for(var i=0;i<hrp.length;i++)r.push(hrp.charCodeAt(i)>>5);r.push(0);for(var j=0;j<hrp.length;j++)r.push(hrp.charCodeAt(j)&31);return r;}
+function polymod(v){var GEN=[0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3],chk=1;for(var p=0;p<v.length;p++){var b=chk>>25;chk=(chk&0x1ffffff)<<5^v[p];for(var i=0;i<5;i++)if((b>>i)&1)chk^=GEN[i];}return chk;}
+function bech32Decode(s){
+  if(s.length<8) throw new Error("слишком короткая строка для bech32");
+  var hasLower=false,hasUpper=false;
+  for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);if(c<33||c>126)throw new Error("недопустимый символ (вне 33..126)");var ch=s[i];if(ch>="a"&&ch<="z")hasLower=true;if(ch>="A"&&ch<="Z")hasUpper=true;}
+  if(hasLower&&hasUpper) throw new Error("смешанный регистр запрещён bech32");
+  var lo=s.toLowerCase();
+  var pos=lo.lastIndexOf("1");
+  if(pos<1) throw new Error("нет разделителя '1' (нет human-readable части)");
+  var hrp=lo.slice(0,pos), rest=lo.slice(pos+1);
+  if(rest.length<6) throw new Error("data-часть короче контрольной суммы (6 символов)");
+  var vals=[];
+  for(var k=0;k<rest.length;k++){var v=CMAP[rest[k]];if(v===undefined)throw new Error("символ вне bech32-алфавита: '"+rest[k]+"'");vals.push(v);}
+  if(polymod(hrpExpand(hrp).concat(vals))!==1) throw new Error("неверная bech32-контрольная сумма");
+  return {hrp:hrp, data:vals.slice(0,vals.length-6)};
+}
+function convertBits(data,fromB,toB,pad){var acc=0,bits=0,out=[],max=(1<<toB)-1;for(var i=0;i<data.length;i++){acc=(acc<<fromB)|data[i];bits+=fromB;while(bits>=toB){bits-=toB;out.push((acc>>bits)&max);}}if(pad){if(bits>0)out.push((acc<<(toB-bits))&max);}else{if(bits>0&&((acc<<(toB-bits))&max)!==0)throw new Error("ненулевой padding");}return out;}
+function bitsToInt(groups){var v=0;for(var i=0;i<groups.length;i++)v=v*32+groups[i];return v;}
+function bytesToHex(b){var h="";for(var i=0;i<b.length;i++){var x=b[i].toString(16);if(x.length<2)x="0"+x;h+=x;}return h;}
+var HRP_RE=/^ln(bcrt|bc|tbs|tb)([0-9]+[munp]?)?$/;
+var NETS={bc:"mainnet (bitcoin)",tb:"testnet",tbs:"signet",bcrt:"regtest"};
+function parseAmount(hrp){
+  var m=HRP_RE.exec(hrp);
+  if(!m) throw new Error("префикс не lnbc/lntb/lntbs/lnbcrt [+сумма]: '"+hrp+"'");
+  var cur=m[1], amt=m[2]||"";
+  var out={currency:cur,network:NETS[cur],amountStr:amt||"(не указана)"};
+  if(!amt){out.msats=null;out.btc=null;out.sats=null;return out;}
+  var mm=/^([0-9]+)([munp]?)$/.exec(amt);
+  if(!mm) throw new Error("сумма в префиксе неверна: '"+amt+"'");
+  var numS=mm[1], mul=mm[2];
+  if(numS.length>1&&numS[0]==="0") throw new Error("ведущие нули в сумме запрещены");
+  if(!/^[1-9][0-9]*$/.test(numS) && numS!=="0") throw new Error("сумма должна быть положительным целым");
+  var num=BigInt(numS);
+  if(num===0n) throw new Error("сумма должна быть > 0");
+  var msats;
+  if(mul==="m")msats=num*100000000n;
+  else if(mul==="u")msats=num*100000n;
+  else if(mul==="n")msats=num*100n;
+  else if(mul==="p"){if(num%10n!==0n)throw new Error("p-множитель: последняя цифра суммы должна быть 0 (целые msat)");msats=num/10n;}
+  else if(mul==="")msats=num*100000000000n;
+  else throw new Error("неизвестный множитель: '"+mul+"'");
+  out.msats=msats.toString();
+  // btc float строкой без потери: msats / 1e11
+  var MS=100000000000n, btcI=msats/MS, btcR=msats%MS;
+  var rs=btcR.toString();while(rs.length<11)rs="0"+rs;rs=rs.replace(/0+$/,"");
+  out.btc=rs===""?btcI.toString():btcI.toString()+"."+rs;
+  out.sats=(Number(msats)/1000).toString();
+  out.multiplier=mul||"(нет)";
+  return out;
+}
+var TAGN={1:"p",3:"r",5:"9",6:"x",9:"f",13:"d",16:"s",19:"n",23:"h",24:"c",27:"m"};
+function decodeInvoice(raw){
+  var s=(raw||"").trim().replace(/\s+/g,"");
+  if(!s) throw new Error("пустой ввод: вставь инвойс lnbc…/lntb…");
+  if(/^lightning:/i.test(s)) s=s.replace(/^lightning:/i,"");
+  var dec=bech32Decode(s);
+  var amt=parseAmount(dec.hrp);
+  var d=dec.data;
+  if(d.length<7+104) throw new Error("data-часть слишком короткая (минимум timestamp 7 + signature 104 группы, есть "+d.length+")");
+  var tsGroups=d.slice(0,7);
+  var ts=bitsToInt(tsGroups);
+  var body=d.slice(7,d.length-104);
+  var sigGroups=d.slice(d.length-104);
+  // подпись: 104*5=520 бит = 65 байт
+  var sigBytes=convertBits(sigGroups,5,8,false);
+  if(sigBytes.length!==65) throw new Error("подпись неверной длины: "+sigBytes.length+" байт (ожидалось 65)");
+  var sigPresent=true;
+  var f={p:[],d:[],h:[],x:[],n:[],s:[],c:[],f:[],r:[],f9:[],m:[],unknown:[]};
+  var pos=0, order=[];
+  while(pos<body.length){
+    if(pos+3>body.length) throw new Error("обрезан заголовок tagged-поля на позиции "+pos);
+    var typ=body[pos], len=body[pos+1]*32+body[pos+2];
+    if(pos+3+len>body.length) throw new Error("tagged-поле type="+typ+" выходит за границы (len="+len+")");
+    var val=body.slice(pos+3,pos+3+len);
+    order.push({typ:typ,len:len,val:val});
+    var nm=TAGN[typ];
+    if(nm==="p")f.p.push(val);else if(nm==="d")f.d.push(val);else if(nm==="h")f.h.push(val);
+    else if(nm==="x")f.x.push(val);else if(nm==="n")f.n.push(val);else if(nm==="s")f.s.push(val);
+    else if(nm==="c")f.c.push(val);else if(nm==="f")f.f.push(val);else if(nm==="r")f.r.push(val);
+    else if(nm==="9")f9push(val);else if(nm==="m")f.m.push(val);else f.unknown.push({typ:typ,val:val});
+    function f9push(v){f.f9.push(v);}
+    pos+=3+len;
+  }
+  // обязательные проверки
+  if(f.p.length!==1) throw new Error("поле p (payment_hash) должно быть ровно 1, найдено "+f.p.length);
+  if(f.p[0].length!==52) throw new Error("поле p неверной длины: "+f.p[0].length+" (надо 52)");
+  if(f.s.length!==1) throw new Error("поле s (payment_secret) должно быть ровно 1, найдено "+f.s.length);
+  if(f.s[0].length!==52) throw new Error("поле s неверной длины: "+f.s[0].length+" (надо 52)");
+  if((f.d.length>0&&f.h.length>0)||(f.d.length===0&&f.h.length===0)) throw new Error("нужно ровно одно из d / h (описание или его hash): d="+f.d.length+", h="+f.h.length);
+  if(f.d.length>1) throw new Error("поле d должно быть не более 1");
+  if(f.h.length>1) throw new Error("поле h должно быть не более 1");
+  if(f.h.length===1&&f.h[0].length!==52) throw new Error("поле h неверной длины: "+f.h[0].length+" (надо 52)");
+  for(var ni=0;ni<f.n.length;ni++) if(f.n[ni].length!==53) throw new Error("поле n неверной длины: "+f.n[ni].length+" (надо 53)");
+  var paymentHash=bytesToHex(convertBits(f.p[0],5,8,false));
+  var paymentSecret=bytesToHex(convertBits(f.s[0],5,8,false));
+  var desc=null,descHash=null;
+  if(f.d.length===1){var db=convertBits(f.d[0],5,8,false);try{desc=new TextDecoder("utf-8",{fatal:true}).decode(new Uint8Array(db));}catch(e){throw new Error("поле d не валидный UTF-8: "+e.message);}}
+  if(f.h.length===1)descHash=bytesToHex(convertBits(f.h[0],5,8,false));
+  var expiry=3600,expirySet=false;
+  if(f.x.length>=1){expiry=bitsToInt(f.x[0]);expirySet=true;}
+  var cltv=18;if(f.c.length>=1)cltv=bitsToInt(f.c[0]);
+  var payee=null;
+  if(f.n.length>=1)payee=bytesToHex(convertBits(f.n[0],5,8,false));
+  var routeFields=f.r.length,routeHops=0;
+  for(var ri=0;ri<f.r.length;ri++){var bits=f.r[ri].length*5;routeHops+=Math.floor(bits/408);}
+  var feats=null;
+  if(f.f9.length>=1)feats=bytesToHex(convertBits(f.f9[0],5,8,false));
+  var meta=null;
+  if(f.m.length>=1)meta=bytesToHex(convertBits(f.m[0],5,8,false));
+  var dt="";try{dt=new Date(ts*1000).toISOString();}catch(e){dt="невалидная дата";}
+  return {hrp:dec.hrp,net:amt.network,currency:amt.currency,amountStr:amt.amountStr,multiplier:amt.multiplier||"-",btc:amt.btc,sats:amt.sats,msats:amt.msats,
+    timestamp:ts,datetime:dt,paymentHash:paymentHash,paymentSecret:paymentSecret,description:desc,descriptionHash:descHash,
+    expiry:expiry,expiryExplicit:expirySet,cltv:cltv,payee:payee,routeFields:routeFields,routeHops:routeHops,
+    features:feats,metadata:meta,fallbacks:f.f.length,sigPresent:sigPresent,sigHex:bytesToHex(sigBytes.slice(0,64)),sigRec:sigBytes[64]};
+}
+var EXAMPLES=[
+"lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql",
+"lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh",
+"lnbc20m1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqs9qrsgq7ea976txfraylvgzuxs8kgcw23ezlrszfnh8r6qtfpr6cxga50aj6txm9rxrydzd06dfeawfk6swupvz4erwnyutnjq7x39ymw6j38gp7ynn44",
+"lntb20m1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygshp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqfpp3x9et2e20v6pu37c5d9vax37wxq72un989qrsgqdj545axuxtnfemtpwkc45hx9d2ft7x04mt8q7y6t0k2dge9e7h8kpy9p34ytyslj3yu569aalz2xdk8xkd7ltxqld94u8h2esmsmacgpghe9k8",
+"lnbc20m1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsfpp3qjmp7lwpagxun9pygexvgpjdc4jdj85fr9yq20q82gphp2nflc7jtzrcazrra7wwgzxqc8u7754cdlpfrmccae92qgzqvzq2ps8pqqqqqqpqqqqq9qqqvpeuqafqxu92d8lr6fvg0r5gv0heeeqgcrqlnm6jhphu9y00rrhy4grqszsvpcgpy9qqqqqqgqqqqq7qqzq9qrsgqdfjcdk6w3ak5pca9hwfwfh63zrrz06wwfya0ydlzpgzxkn5xagsqz7x9j4jwe7yj7vaf2k9lqsdk45kts2fd0fkr28am0u4w95tt2nsq76cqw0"
+];
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function render(r){
+  var rows=[
+    ["Префикс (hrp)",r.hrp],["Сеть",r.net+" ("+r.currency+")"],
+    ["Сумма (строка)",r.amountStr],["Множитель",r.multiplier],
+    ["Сумма BTC",r.btc===null?"(не указана)":r.btc],
+    ["Сумма sats",r.sats===null?"(не указана)":r.sats],
+    ["Сумма msats",r.msats===null?"(не указана)":r.msats],
+    ["Timestamp",r.timestamp+" ("+r.datetime+")"],
+    ["payment_hash (p)",r.paymentHash],
+    ["payment_secret (s)",r.paymentSecret],
+    ["description (d)",r.description===null?"—":r.description],
+    ["description_hash (h)",r.descriptionHash===null?"—":r.descriptionHash],
+    ["expiry (x), сек",(r.expiryExplicit?"":"по умолч. ")+r.expiry],
+    ["min_final_cltv (c)",r.cltv],
+    ["payee (n)",r.payee===null?"— (нет n-поля; pubkey требует secp256k1-recovery, не вычисляется)":r.payee],
+    ["fallback (f), шт",r.fallbacks],
+    ["route hints: r-полей",r.routeFields],["route hints: хопов (оценка)",r.routeHops],
+    ["features (9, hex)",r.features===null?"—":r.features],
+    ["metadata (m, hex)",r.metadata===null?"—":r.metadata],
+    ["signature present","да (65 байт: 64 R||S + 1 recovery="+r.sigRec+")"],
+    ["signature R||S (hex, 64Б)",r.sigHex]
+  ];
+  var h='<p class="ok">OK — инвойс разобран.</p><table>';
+  for(var i=0;i<rows.length;i++)h+="<tr><th>"+esc(rows[i][0])+"</th><td class='mono'>"+esc(rows[i][1])+"</td></tr>";
+  return h+"</table>";
+}
+document.getElementById("dec").onclick=function(){
+  var out=document.getElementById("out");
+  try{var r=decodeInvoice(document.getElementById("inv").value);out.innerHTML=render(r);}
+  catch(e){out.innerHTML='<p class="err">ОШИБКА: '+esc(e.message)+"</p>";}
+};
+document.getElementById("clr").onclick=function(){document.getElementById("inv").value="";document.getElementById("out").innerHTML="";};
+var btns=document.querySelectorAll("[data-ex]");
+for(var b=0;b<btns.length;b++)(function(el){el.onclick=function(){document.getElementById("inv").value=EXAMPLES[+el.getAttribute("data-ex")];document.getElementById("dec").click();};})(btns[b]);
+</script>
+</body>
+</html>
