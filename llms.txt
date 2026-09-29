@@ -1,0 +1,7 @@
+# bolt11-decoder
+
+> Local BOLT11 Lightning invoice decoder — 100% browser-only, no dependencies, no network.
+
+- Site: https://visawestern.github.io/bolt11-decoder/
+- Static demo, no backend. Open index.html in a browser.
+- License: see LICENSE. Source: https://github.com/visawestern/bolt11-decoder
